@@ -353,7 +353,8 @@ public class Master {
             boolean success = processBlock(operation, jobId, matrixA, matrixB, result, task);
             if (!success) {
                 task.attempts++;
-                if (getHealthyWorkerCount() == 0 || task.attempts >= TaskUnit.MAX_ATTEMPTS) {
+                boolean retryEligible = task.attempts < TaskUnit.MAX_ATTEMPTS;
+                if (getHealthyWorkerCount() == 0 || !retryEligible) {
                     fallbackQueue.offer(task);
                 } else {
                     taskQueue.offer(task);

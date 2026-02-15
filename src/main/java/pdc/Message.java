@@ -118,7 +118,7 @@ public class Message {
             throw new IllegalArgumentException("Invalid frame length");
         }
         byte[] body = new byte[bodyLength];
-        in.readFully(body);
+        readExactly(in, body, 0, bodyLength);
         return unpackBody(java.nio.ByteBuffer.wrap(body));
     }
 
@@ -156,5 +156,19 @@ public class Message {
             body.get(bytes);
         }
         return bytes;
+    }
+
+    private static void readExactly(java.io.DataInputStream in, byte[] target, int offset, int length)
+            throws java.io.IOException {
+        int cursor = offset;
+        int remaining = length;
+        while (remaining > 0) {
+            int read = in.read(target, cursor, remaining);
+            if (read < 0) {
+                throw new java.io.EOFException("Stream ended mid-frame");
+            }
+            cursor += read;
+            remaining -= read;
+        }
     }
 }
