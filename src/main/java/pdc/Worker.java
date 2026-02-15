@@ -113,17 +113,7 @@ public class Worker {
         try {
             while (running) {
                 try {
-                    int frameLen = in.readInt();
-                    if (frameLen <= 0) {
-                        break;
-                    }
-                    byte[] body = new byte[frameLen];
-                    in.readFully(body);
-                    ByteArrayOutputStream frameOut = new ByteArrayOutputStream(frameLen + 4);
-                    DataOutputStream wrapper = new DataOutputStream(frameOut);
-                    wrapper.writeInt(frameLen);
-                    wrapper.write(body);
-                    Message msg = Message.parse(frameOut.toByteArray());
+                    Message msg = Message.readFrom(in);
                     inbox.offer(msg);
                 } catch (SocketTimeoutException timeout) {
                     // timeout detected, continue to wait for messages
@@ -223,7 +213,7 @@ public class Worker {
 
     private void sendMessage(Message message) throws IOException {
         synchronized (sendLock) {
-            out.write(message.pack());
+            message.writeTo(out);
             out.flush();
         }
     }

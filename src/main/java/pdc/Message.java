@@ -11,6 +11,7 @@ package pdc;
 public class Message {
     public static final String MAGIC = "CSM218";
     public static final int CURRENT_VERSION = 1;
+    public static final int MAX_FRAME_SIZE = 64 * 1024 * 1024;
 
     public String magic;
     public int version;
@@ -56,99 +57,104 @@ public class Message {
     public byte[] pack() {
         validate();
 
-        try {
-            byte[] magicBytes = magic.getBytes(java.nio.charset.StandardCharsets.UTF_8);
-            byte[] typeBytes = messageType.getBytes(java.nio.charset.StandardCharsets.UTF_8);
-            byte[] idBytes = studentId.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+        byte[] magicBytes = magic.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+        byte[] typeBytes = messageType.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+        byte[] idBytes = studentId.getBytes(java.nio.charset.StandardCharsets.UTF_8);
 
-            java.io.ByteArrayOutputStream bodyStream = new java.io.ByteArrayOutputStream();
-            java.io.DataOutputStream bodyOut = new java.io.DataOutputStream(bodyStream);
-
-            bodyOut.writeInt(magicBytes.length);
-            bodyOut.write(magicBytes);
-            bodyOut.writeInt(version);
-
-            bodyOut.writeInt(typeBytes.length);
-            bodyOut.write(typeBytes);
-
-            bodyOut.writeInt(idBytes.length);
-            bodyOut.write(idBytes);
-
-            bodyOut.writeLong(timestamp);
-
-            bodyOut.writeInt(payload.length);
-            if (payload.length > 0) {
-                bodyOut.write(payload);
-            }
-            bodyOut.flush();
-
-            byte[] body = bodyStream.toByteArray();
-            java.io.ByteArrayOutputStream framedStream = new java.io.ByteArrayOutputStream();
-            java.io.DataOutputStream framedOut = new java.io.DataOutputStream(framedStream);
-
-            framedOut.writeInt(body.length);
-            framedOut.write(body);
-            framedOut.flush();
-            return framedStream.toByteArray();
-        } catch (java.io.IOException e) {
-            throw new IllegalStateException("Failed to pack message", e);
+        int bodyLen = 4 + magicBytes.length
+                + 4
+                + 4 + typeBytes.length
+                + 4 + idBytes.length
+                + 8
+                + 4 + payload.length;
+        if (bodyLen <= 0 || bodyLen > MAX_FRAME_SIZE) {
+            throw new IllegalArgumentException("Frame too large");
         }
+
+        java.nio.ByteBuffer buffer = java.nio.ByteBuffer.allocate(4 + bodyLen);
+        buffer.putInt(bodyLen);
+        putBytes(buffer, magicBytes);
+        buffer.putInt(version);
+        putBytes(buffer, typeBytes);
+        putBytes(buffer, idBytes);
+        buffer.putLong(timestamp);
+        putBytes(buffer, payload);
+        return buffer.array();
     }
 
     /**
      * Reconstructs a Message from a byte stream.
      */
     public static Message unpack(byte[] data) {
-        try {
-            java.io.DataInputStream in = new java.io.DataInputStream(new java.io.ByteArrayInputStream(data));
-            int bodyLength = in.readInt();
-            if (bodyLength < 0 || bodyLength > data.length - 4) {
-                throw new IllegalArgumentException("Invalid frame length");
-            }
-            byte[] body = new byte[bodyLength];
-            in.readFully(body);
-
-            java.io.DataInputStream bodyIn = new java.io.DataInputStream(new java.io.ByteArrayInputStream(body));
-            int magicLen = bodyIn.readInt();
-            if (magicLen < 0) {
-                throw new IllegalArgumentException("Invalid magic length");
-            }
-            byte[] magicBytes = new byte[magicLen];
-            bodyIn.readFully(magicBytes);
-
-            Message msg = new Message();
-            msg.magic = new String(magicBytes, java.nio.charset.StandardCharsets.UTF_8);
-            msg.version = bodyIn.readInt();
-
-            int typeLen = bodyIn.readInt();
-            byte[] typeBytes = new byte[typeLen];
-            bodyIn.readFully(typeBytes);
-            msg.messageType = new String(typeBytes, java.nio.charset.StandardCharsets.UTF_8);
-
-            int idLen = bodyIn.readInt();
-            byte[] idBytes = new byte[idLen];
-            bodyIn.readFully(idBytes);
-            msg.studentId = new String(idBytes, java.nio.charset.StandardCharsets.UTF_8);
-
-            msg.timestamp = bodyIn.readLong();
-
-            int payloadLen = bodyIn.readInt();
-            if (payloadLen < 0) {
-                throw new IllegalArgumentException("Invalid payload length");
-            }
-            msg.payload = new byte[payloadLen];
-            if (payloadLen > 0) {
-                bodyIn.readFully(msg.payload);
-            }
-
-            msg.validate();
-            return msg;
-        } catch (java.io.IOException e) {
-            throw new IllegalArgumentException("Failed to parse message", e);
+        if (data == null || data.length < 4) {
+            throw new IllegalArgumentException("Frame too small");
         }
+        java.nio.ByteBuffer frame = java.nio.ByteBuffer.wrap(data);
+        int bodyLength = frame.getInt();
+        if (bodyLength < 0 || bodyLength > MAX_FRAME_SIZE) {
+            throw new IllegalArgumentException("Invalid frame length");
+        }
+        if (data.length < 4 + bodyLength) {
+            throw new IllegalArgumentException("Incomplete frame");
+        }
+
+        byte[] body = new byte[bodyLength];
+        frame.get(body);
+        return unpackBody(java.nio.ByteBuffer.wrap(body));
     }
 
     public static Message parse(byte[] data) {
         return unpack(data);
+    }
+
+    public void writeTo(java.io.DataOutputStream out) throws java.io.IOException {
+        byte[] frame = pack();
+        out.write(frame);
+    }
+
+    public static Message readFrom(java.io.DataInputStream in) throws java.io.IOException {
+        int bodyLength = in.readInt();
+        if (bodyLength < 0 || bodyLength > MAX_FRAME_SIZE) {
+            throw new IllegalArgumentException("Invalid frame length");
+        }
+        byte[] body = new byte[bodyLength];
+        in.readFully(body);
+        return unpackBody(java.nio.ByteBuffer.wrap(body));
+    }
+
+    private static Message unpackBody(java.nio.ByteBuffer body) {
+        byte[] magicBytes = readBytes(body);
+        Message msg = new Message();
+        msg.magic = new String(magicBytes, java.nio.charset.StandardCharsets.UTF_8);
+        msg.version = body.getInt();
+        msg.messageType = new String(readBytes(body), java.nio.charset.StandardCharsets.UTF_8);
+        msg.studentId = new String(readBytes(body), java.nio.charset.StandardCharsets.UTF_8);
+        msg.timestamp = body.getLong();
+        msg.payload = readBytes(body);
+        msg.validate();
+        return msg;
+    }
+
+    private static void putBytes(java.nio.ByteBuffer buffer, byte[] value) {
+        if (value == null) {
+            buffer.putInt(0);
+            return;
+        }
+        buffer.putInt(value.length);
+        if (value.length > 0) {
+            buffer.put(value);
+        }
+    }
+
+    private static byte[] readBytes(java.nio.ByteBuffer body) {
+        int len = body.getInt();
+        if (len < 0 || len > body.remaining()) {
+            throw new IllegalArgumentException("Invalid field length");
+        }
+        byte[] bytes = new byte[len];
+        if (len > 0) {
+            body.get(bytes);
+        }
+        return bytes;
     }
 }

@@ -11,6 +11,8 @@ import java.net.SocketTimeoutException;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.HashSet;
+import java.util.Set;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.Callable;
 import java.util.concurrent.ConcurrentHashMap;
@@ -39,6 +41,9 @@ public class Master {
     private final ConcurrentHashMap<Integer, CompletableFuture<ResultBlock>> taskFutures = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, CompletableFuture<Boolean>> initFutures = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<Integer, Boolean> completedTasks = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<Integer, TaskUnit> taskRegistry = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<Integer, String> taskAssignments = new ConcurrentHashMap<>();
+    private final ConcurrentLinkedQueue<TaskUnit> reassignmentQueue = new ConcurrentLinkedQueue<>();
     private final AtomicInteger taskCounter = new AtomicInteger();
     private final AtomicInteger taskIdSeq = new AtomicInteger();
     private final AtomicInteger jobIdSeq = new AtomicInteger();
@@ -109,11 +114,16 @@ public class Master {
         ConcurrentLinkedQueue<TaskUnit> fallbackQueue = new ConcurrentLinkedQueue<>();
         List<Callable<Void>> dispatchers = new ArrayList<>();
 
+        taskRegistry.clear();
+        taskAssignments.clear();
+        reassignmentQueue.clear();
         warmupWorkers(jobId, matrixA, matrixB);
 
         for (int start = 0; start < rowsA; start += blockSize) {
             int end = Math.min(rowsA, start + blockSize);
-            taskQueue.offer(new TaskUnit(jobId, taskIdSeq.incrementAndGet(), start, end));
+            TaskUnit unit = new TaskUnit(jobId, taskIdSeq.incrementAndGet(), start, end);
+            taskRegistry.put(unit.taskId, unit);
+            taskQueue.offer(unit);
         }
 
         for (int i = 0; i < poolSize; i++) {
@@ -210,17 +220,7 @@ public class Master {
             DataOutputStream out = connection.out;
             while (true) {
                 try {
-                    int frameLen = in.readInt();
-                    if (frameLen <= 0) {
-                        break;
-                    }
-                    ByteArrayOutputStream frameOut = new ByteArrayOutputStream(frameLen + 4);
-                    DataOutputStream wrapper = new DataOutputStream(frameOut);
-                    wrapper.writeInt(frameLen);
-                    byte[] body = new byte[frameLen];
-                    in.readFully(body);
-                    wrapper.write(body);
-                    Message msg = Message.unpack(frameOut.toByteArray());
+                    Message msg = Message.readFrom(in);
                     msg.validate();
 
                     if ("HEARTBEAT".equalsIgnoreCase(msg.messageType)) {
@@ -237,7 +237,7 @@ public class Master {
                             workers.put(msg.studentId, connection);
                         }
                         Message ack = new Message(REGISTER_ACK, masterId, "OK".getBytes());
-                        out.write(ack.pack());
+                        ack.writeTo(out);
                         out.flush();
                         continue;
                     }
@@ -290,7 +290,7 @@ public class Master {
                         int[][] response = (int[][]) coordinate(request.operation, request.matrixA, request.matrixB, request.workerCount);
                         byte[] payload = buildJobResponsePayload(response);
                         Message reply = new Message(JOB_RESPONSE, masterId, payload);
-                        out.write(reply.pack());
+                        reply.writeTo(out);
                         out.flush();
                         continue;
                     }
@@ -306,7 +306,7 @@ public class Master {
                     if (RPC_REQUEST.equalsIgnoreCase(msg.messageType)) {
                         // Echo the RPC response with a simple acknowledgement payload.
                         Message response = new Message(RPC_RESPONSE, masterId, "OK".getBytes());
-                        out.write(response.pack());
+                        response.writeTo(out);
                         out.flush();
                     }
                 } catch (SocketTimeoutException timeout) {
@@ -333,7 +333,10 @@ public class Master {
             ConcurrentLinkedQueue<TaskUnit> taskQueue,
             ConcurrentLinkedQueue<TaskUnit> fallbackQueue) {
         while (true) {
-            TaskUnit task = taskQueue.poll();
+            TaskUnit task = reassignmentQueue.poll();
+            if (task == null) {
+                task = taskQueue.poll();
+            }
             if (task == null) {
                 if (taskQueue.isEmpty()) {
                     break;
@@ -378,6 +381,7 @@ public class Master {
         CompletableFuture<ResultBlock> future = new CompletableFuture<>();
         taskFutures.put(taskId, future);
         worker.inFlight.incrementAndGet();
+        taskAssignments.put(taskId, worker.workerId);
 
         try {
             byte[] payload = buildTaskPayload(operation, jobId, taskId, task.startRow, task.endRow, matrixA, matrixB, false);
@@ -390,9 +394,11 @@ public class Master {
             }
             applyResult(block, result);
             completedTasks.put(taskId, Boolean.TRUE);
+            taskAssignments.remove(taskId);
             return true;
         } catch (Exception e) {
             worker.healthy = false;
+            taskAssignments.remove(taskId);
             return false;
         } finally {
             worker.inFlight.decrementAndGet();
@@ -437,6 +443,19 @@ public class Master {
 
     private void reassignInFlightTasks(String workerId) {
         taskCounter.incrementAndGet();
+        Set<Integer> toReassign = new HashSet<>();
+        for (Map.Entry<Integer, String> entry : taskAssignments.entrySet()) {
+            if (workerId.equals(entry.getValue()) && !completedTasks.containsKey(entry.getKey())) {
+                toReassign.add(entry.getKey());
+            }
+        }
+        for (Integer taskId : toReassign) {
+            TaskUnit unit = taskRegistry.get(taskId);
+            if (unit != null) {
+                taskAssignments.remove(taskId);
+                reassignmentQueue.offer(unit);
+            }
+        }
     }
 
     private WorkerConnection selectWorker() {
@@ -783,7 +802,7 @@ public class Master {
 
         void send(Message msg) throws IOException {
             synchronized (out) {
-                out.write(msg.pack());
+                msg.writeTo(out);
                 out.flush();
             }
         }
